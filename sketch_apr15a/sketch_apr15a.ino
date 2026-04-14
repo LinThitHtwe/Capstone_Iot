@@ -6,7 +6,12 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <stdio.h>
-#include <string.h>
+
+/** Declared before any function so Arduino's auto-prototypes do not reference an unknown type. */
+struct TableButtonDebouncer {
+  uint8_t phase; /* 0 = armed (released), 1 = latched until full release */
+  unsigned long mark;
+};
 
 // Replace with your network credentials (STATION)
 #define ssid "Kakak 4 Bocil"
@@ -30,8 +35,16 @@
 
 #define ST1_DEBOUNCE_MS 600
 #define REMOTE_POLL_MS 2000
-#define ST1_RESV_POLL_MS 400
-#define HTTP_TIMEOUT_MS 4000
+/** GET table status (poll): keep generous for flaky Wi-Fi. */
+#define HTTP_GET_TIMEOUT_MS 3500
+/** POST after button/weight: shorter so a dead server does not freeze the loop for tens of seconds. */
+#define HTTP_POST_TIMEOUT_MS 2200
+#define HTTP_POST_MAX_ATTEMPTS 2
+/**
+ * HX711 + dual OLED + HTTP poll are slow; run them on this interval so the loop still
+ * spins fast enough for button debouncing (stable LOW/HIGH ms) to feel responsive.
+ */
+#define SLOW_LOOP_PERIOD_MS 40
 /** LOW must be stable this long (ms) before we count one press (filters chatter). */
 #define BTN_STABLE_LOW_MS 45
 /** HIGH (released) must be stable this long before the next press can register. */
@@ -61,75 +74,6 @@ static String makeTableStatusUrl(int tableNumber) {
          "/api/iot/table-status/" + String(tableNumber) + "/";
 }
 
-static String makeTableReservationUrl(int tableNumber) {
-  return String("http://") + API_HOST + ":" + String(API_PORT) +
-         "/api/iot/table-reservation/" + String(tableNumber) + "/";
-}
-
-/** Table 1 booking flags from GET /api/iot/table-reservation/1/ (demo-friendly). */
-static bool st1ActiveReservation = false;
-static bool st1UnfinishedBooking = false;
-static char st1ReservationEndLocal[16] = "--:--:--";
-
-/** Read JSON boolean after "key": (key must include leading "). */
-static bool jsonBoolAfterKey(const String& body, const char* keyWithQuote) {
-  int k = body.indexOf(keyWithQuote);
-  if (k < 0) return false;
-  int c = body.indexOf(':', k + (int)strlen(keyWithQuote));
-  if (c < 0) return false;
-  int i = c + 1;
-  while (i < (int)body.length() && (body.charAt(i) == ' ' || body.charAt(i) == '\t')) i++;
-  return body.substring(i).startsWith("true");
-}
-
-/** Copy quoted string value for "reservation_end_local" (handles : null). */
-static void jsonCopyReservationEndLocal(const String& body, char* out, size_t outSz) {
-  if (outSz == 0) return;
-  out[0] = '\0';
-  const char* tag = "\"reservation_end_local\"";
-  int k = body.indexOf(tag);
-  if (k < 0) return;
-  int colon = body.indexOf(':', k);
-  if (colon < 0) return;
-  int i = colon + 1;
-  while (i < (int)body.length() && (body.charAt(i) == ' ' || body.charAt(i) == '\t')) i++;
-  if (i >= (int)body.length()) return;
-  if (body.charAt(i) != '"') return;
-  i++;
-  int start = i;
-  int end = body.indexOf('"', start);
-  if (end <= start || (size_t)(end - start) >= outSz) return;
-  body.substring(start, end).toCharArray(out, outSz);
-}
-
-static void refreshSt1ReservationFromApi() {
-  if (WiFi.status() != WL_CONNECTED) return;
-  HTTPClient http;
-  String url = makeTableReservationUrl(TABLE_NUM_ST1);
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(url)) {
-    Serial.println("resv: http.begin failed");
-    return;
-  }
-  int code = http.GET();
-  if (code != 200) {
-    Serial.printf("GET resv %s code=%d\n", url.c_str(), code);
-    http.end();
-    return;
-  }
-  String body = http.getString();
-  http.end();
-
-  /* Only replace state on success so a failed GET does not wipe a good demo read. */
-  st1ActiveReservation = jsonBoolAfterKey(body, "\"has_active_reservation\"");
-  st1UnfinishedBooking = jsonBoolAfterKey(body, "\"has_unfinished_reservation\"");
-  jsonCopyReservationEndLocal(body, st1ReservationEndLocal, sizeof(st1ReservationEndLocal));
-  if (st1ReservationEndLocal[0] == '\0') {
-    strncpy(st1ReservationEndLocal, "--:--:--", sizeof(st1ReservationEndLocal));
-    st1ReservationEndLocal[sizeof(st1ReservationEndLocal) - 1] = '\0';
-  }
-}
-
 /** Parse JSON body like {"status":2}. Returns -1 on failure. */
 static int parseStatusJson(const String& body) {
   int i = body.indexOf("status");
@@ -155,7 +99,7 @@ static int fetchStatusFromApi(int tableNumber, int defaultIot) {
   if (WiFi.status() != WL_CONNECTED) return defaultIot;
   HTTPClient http;
   String url = makeTableStatusUrl(tableNumber);
-  http.setTimeout(HTTP_TIMEOUT_MS);
+  http.setTimeout(HTTP_GET_TIMEOUT_MS);
   if (!http.begin(url)) {
     Serial.println("http.begin failed");
     return defaultIot;
@@ -179,12 +123,14 @@ static int fetchStatusFromApi(int tableNumber, int defaultIot) {
 static bool postStatusToApi(int tableNumber, int iotState) {
   if (WiFi.status() != WL_CONNECTED) return false;
   int apiVal = apiStatusFromIot(iotState);
-  String body = String("{\"status\":") + String(apiVal) + "}");
+  char jsonBuf[48];
+  snprintf(jsonBuf, sizeof(jsonBuf), "{\"status\":%d}", apiVal);
+  String body(jsonBuf);
   String url = makeTableStatusUrl(tableNumber);
-  for (int attempt = 0; attempt < 3; attempt++) {
-    if (attempt > 0) delay(100);
+  for (int attempt = 0; attempt < HTTP_POST_MAX_ATTEMPTS; attempt++) {
+    if (attempt > 0) delay(80);
     HTTPClient http;
-    http.setTimeout(HTTP_TIMEOUT_MS);
+    http.setTimeout(HTTP_POST_TIMEOUT_MS);
     if (!http.begin(url)) {
       Serial.println("post: http.begin failed");
       continue;
@@ -212,12 +158,6 @@ static void setRgbForState(int pinR, int pinG, int pinB, int iotState) {
   digitalWrite(pinG, iotState == 1 ? HIGH : LOW);
   digitalWrite(pinB, iotState == 2 ? HIGH : LOW);
 }
-
-/** INPUT_PULLUP: pressed = LOW. One press = one fire; must release before another. */
-struct TableButtonDebouncer {
-  uint8_t phase; /* 0 = armed (released), 1 = latched until full release */
-  unsigned long mark;
-};
 
 /** Returns true once when LOW has been stable long enough; ignores bounce until HIGH release. */
 static bool consumeStableTablePress(int pin, TableButtonDebouncer& d, unsigned long now) {
@@ -397,8 +337,6 @@ void setup() {
   setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
   setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
 
-  refreshSt1ReservationFromApi();
-
 /*
    //init display OLED
   display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
@@ -482,6 +420,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   static unsigned long lastPoll = 0;
+  static unsigned long lastSlowWork = 0;
   static TableButtonDebouncer st2Btn = {0, 0};
   static TableButtonDebouncer rt1Btn = {0, 0};
   static TableButtonDebouncer gt1Btn = {0, 0};
@@ -510,6 +449,14 @@ void loop() {
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
 
+  // Let debouncers advance in real time: HX711 + OLED + poll are deferred to a throttled block.
+  if ((unsigned long)(now - lastSlowWork) < (unsigned long)SLOW_LOOP_PERIOD_MS) {
+    delay(1);
+    return;
+  }
+  lastSlowWork = now;
+  now = millis();
+
   unsigned int ADC = scale.get_units();
   float weight = float(ADC) / 2100.00 * 5.00;
   Serial.print("ADC = ");
@@ -517,32 +464,16 @@ void loop() {
   Serial.print(", weight = ");
   Serial.println(weight);
 
-  // ST1: poll reservation JSON often (demo) so end time / reserved flags update quickly.
-  static unsigned long lastSt1ResvPoll = 0;
-  if (now - lastSt1ResvPoll >= ST1_RESV_POLL_MS) {
-    lastSt1ResvPoll = now;
-    refreshSt1ReservationFromApi();
-  }
-
-  // ST1: weight + any unfinished booking -> IoT 0=unavail, 1=avail, 2=reserved; POST maps to API.
+  // ST1: HX711 -> debounced IoT state 0/1 -> POST (2=reserved not used from weight)
   static int st1Cand = -1;
   static unsigned long st1CandSince = 0;
-  const int measWeight = (weight >= 2.00f) ? 0 : 1;
-  const bool st1BookedForDemo = st1ActiveReservation || st1UnfinishedBooking;
-  int st1Desired;
-  if (st1BookedForDemo && measWeight == 1) {
-    st1Desired = 2;
-  } else if (measWeight == 0) {
-    st1Desired = 0;
-  } else {
-    st1Desired = 1;
-  }
+  int meas = (weight >= 2.00f) ? 0 : 1;
   if (st1Cand < 0) {
-    st1Cand = st1Desired;
+    st1Cand = meas;
     st1CandSince = now;
   }
-  if (st1Desired != st1Cand) {
-    st1Cand = st1Desired;
+  if (meas != st1Cand) {
+    st1Cand = meas;
     st1CandSince = now;
   }
   if ((now - st1CandSince) >= ST1_DEBOUNCE_MS && ST1state != st1Cand) {
@@ -550,7 +481,8 @@ void loop() {
     postStatusToApi(TABLE_NUM_ST1, ST1state);
   }
 
-  // OLED bus 2 — ST1 line reflects debounced ST1state + reservation end time when occupied
+  // OLED bus 2 — ST1 line reflects debounced ST1state
+  String endReserveTime = "14:00:00";
   TCA9548A(2);
   display.clearDisplay();
   display.setTextSize(2);
@@ -570,10 +502,10 @@ void loop() {
     display.setCursor(length, 30);
     display.print("WILL AVAILABLE AT");
     display.setTextSize(2);
-    display.getTextBounds(st1ReservationEndLocal, 0, 0, &x, &y, &w, &h);
+    display.getTextBounds("00:00:00", 0, 0, &x, &y, &w, &h);
     length = (SCREEN_WIDTH - w) / 2;
     display.setCursor(length, 50);
-    display.print(st1ReservationEndLocal);
+    display.print(endReserveTime);
   } else if (ST1state == 2) {
     display.setTextSize(1);
     display.getTextBounds("RESERVED", 0, 0, &x, &y, &w, &h);
@@ -592,7 +524,7 @@ void loop() {
   if (now - lastPoll >= REMOTE_POLL_MS && now >= suppressPollUntil) {
     lastPoll = now;
     if (WiFi.status() == WL_CONNECTED) {
-      // Tables 2–4: buttons + remote (ST1 reservation polled above every ST1_RESV_POLL_MS)
+      // Tables 2–4: buttons + remote (ST1 stays weight-driven only after boot).
       ST2state = fetchStatusFromApi(TABLE_NUM_ST2, ST2state);
       RT1state = fetchStatusFromApi(TABLE_NUM_RT1, RT1state);
       GT1state = fetchStatusFromApi(TABLE_NUM_GT1, GT1state);
@@ -604,5 +536,5 @@ void loop() {
 
   refreshDisplay2();
 
-  delay(50);
+  delay(1);
 }
