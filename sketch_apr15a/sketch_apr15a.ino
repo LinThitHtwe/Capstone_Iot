@@ -6,6 +6,7 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <stdio.h>
+#include <string.h>
 
 /** Declared before any function so Arduino's auto-prototypes do not reference an unknown type. */
 struct TableButtonDebouncer {
@@ -35,11 +36,13 @@ struct TableButtonDebouncer {
 
 #define ST1_DEBOUNCE_MS 600
 #define REMOTE_POLL_MS 2000
-/** GET table status (poll): keep generous for flaky Wi-Fi. */
-#define HTTP_GET_TIMEOUT_MS 3500
-/** POST after button/weight: shorter so a dead server does not freeze the loop for tens of seconds. */
-#define HTTP_POST_TIMEOUT_MS 2200
-#define HTTP_POST_MAX_ATTEMPTS 2
+/** GET on boot (first sync): generous for flaky Wi-Fi. */
+#define HTTP_GET_BOOT_TIMEOUT_MS 3500
+/** GET during periodic poll: short so one request does not stall the sketch for seconds. */
+#define HTTP_GET_POLL_TIMEOUT_MS 1200
+/** POST from deferred queue (after LED already updated): one quick try per loop visit. */
+#define HTTP_POST_DEFERRED_TIMEOUT_MS 900
+#define HTTP_POST_DEFERRED_ATTEMPTS 1
 /**
  * HX711 + dual OLED + HTTP poll are slow; run them on this interval so the loop still
  * spins fast enough for button debouncing (stable LOW/HIGH ms) to feel responsive.
@@ -74,6 +77,58 @@ static String makeTableStatusUrl(int tableNumber) {
          "/api/iot/table-status/" + String(tableNumber) + "/";
 }
 
+/** ST1 OLED: live reservation end (HH:MM:SS) from Django; default until first GET. */
+static char st1BookingEndsLocal[16] = "--:--:--";
+
+static String makeSt1WeightAvailabilityUrl() {
+  return String("http://") + API_HOST + ":" + String(API_PORT) +
+         "/api/public/tables/1/weight-availability/";
+}
+
+static void fetchSt1BookingEndsLocalFromApi() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http;
+  String url = makeSt1WeightAvailabilityUrl();
+  http.setTimeout(HTTP_GET_POLL_TIMEOUT_MS);
+  if (!http.begin(url)) {
+    Serial.println("st1 avail: http.begin failed");
+    return;
+  }
+  int code = http.GET();
+  if (code != 200) {
+    Serial.printf("st1 avail GET code=%d\n", code);
+    http.end();
+    return;
+  }
+  String body = http.getString();
+  http.end();
+  const char* key = "\"current_booking_ends_local\":";
+  int i = body.indexOf(key);
+  if (i < 0) {
+    Serial.println("st1 avail: key not found");
+    return;
+  }
+  i += (int)strlen(key);
+  while (i < (int)body.length() && body.charAt(i) == ' ') i++;
+  if (i < (int)body.length() && body.charAt(i) == 'n') {
+    strncpy(st1BookingEndsLocal, "--:--:--", sizeof(st1BookingEndsLocal));
+    st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
+    return;
+  }
+  if (i >= (int)body.length() || body.charAt(i) != '"') return;
+  i++;
+  int j = 0;
+  while (i < (int)body.length() && body.charAt(i) != '"' &&
+         j < (int)sizeof(st1BookingEndsLocal) - 1) {
+    st1BookingEndsLocal[j++] = (char)body.charAt(i++);
+  }
+  st1BookingEndsLocal[j] = '\0';
+  if (j == 0) {
+    strncpy(st1BookingEndsLocal, "--:--:--", sizeof(st1BookingEndsLocal));
+    st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
+  }
+}
+
 /** Parse JSON body like {"status":2}. Returns -1 on failure. */
 static int parseStatusJson(const String& body) {
   int i = body.indexOf("status");
@@ -95,11 +150,11 @@ static int parseStatusJson(const String& body) {
 }
 
 /** GET -> IoT state 0..2; on error returns defaultIot. */
-static int fetchStatusFromApi(int tableNumber, int defaultIot) {
+static int fetchStatusFromApi(int tableNumber, int defaultIot, uint32_t getTimeoutMs) {
   if (WiFi.status() != WL_CONNECTED) return defaultIot;
   HTTPClient http;
   String url = makeTableStatusUrl(tableNumber);
-  http.setTimeout(HTTP_GET_TIMEOUT_MS);
+  http.setTimeout(getTimeoutMs);
   if (!http.begin(url)) {
     Serial.println("http.begin failed");
     return defaultIot;
@@ -120,17 +175,18 @@ static int fetchStatusFromApi(int tableNumber, int defaultIot) {
   return iotStatusFromApi(raw);
 }
 
-static bool postStatusToApi(int tableNumber, int iotState) {
+static bool postStatusToApiWithConfig(
+    int tableNumber, int iotState, uint32_t timeoutMs, int maxAttempts) {
   if (WiFi.status() != WL_CONNECTED) return false;
   int apiVal = apiStatusFromIot(iotState);
   char jsonBuf[48];
   snprintf(jsonBuf, sizeof(jsonBuf), "{\"status\":%d}", apiVal);
   String body(jsonBuf);
   String url = makeTableStatusUrl(tableNumber);
-  for (int attempt = 0; attempt < HTTP_POST_MAX_ATTEMPTS; attempt++) {
+  for (int attempt = 0; attempt < maxAttempts; attempt++) {
     if (attempt > 0) delay(80);
     HTTPClient http;
-    http.setTimeout(HTTP_POST_TIMEOUT_MS);
+    http.setTimeout(timeoutMs);
     if (!http.begin(url)) {
       Serial.println("post: http.begin failed");
       continue;
@@ -145,6 +201,30 @@ static bool postStatusToApi(int tableNumber, int iotState) {
     Serial.printf("POST try %d %s code=%d\n", attempt + 1, url.c_str(), code);
   }
   return false;
+}
+
+/** Deferred POST (single short attempt) — used so buttons never block on HTTP. */
+static bool postStatusToApiDeferred(int tableNumber, int iotState) {
+  return postStatusToApiWithConfig(
+      tableNumber, iotState, HTTP_POST_DEFERRED_TIMEOUT_MS, HTTP_POST_DEFERRED_ATTEMPTS);
+}
+
+/** Latest table status the firmware wants Django to reflect (0 = none pending). */
+static int g_postPendingTable = 0;
+static int g_postPendingIot = 0;
+
+static void scheduleStatusPost(int tableNumber, int iotState) {
+  g_postPendingTable = tableNumber;
+  g_postPendingIot = iotState;
+}
+
+/** Try one deferred POST per slow-path visit (LED/state already updated). */
+static void drainPendingStatusPost() {
+  if (g_postPendingTable == 0) return;
+  if (WiFi.status() != WL_CONNECTED) return;
+  if (postStatusToApiDeferred(g_postPendingTable, g_postPendingIot)) {
+    g_postPendingTable = 0;
+  }
 }
 
 static const char* iotStatusLabel(int s) {
@@ -329,10 +409,11 @@ void setup() {
 
   // All four slots match demo tables 1–4; sync persisted ``Table.status`` from API on boot
   // (demo seeds 1=free, 2=occupied, 3=reserved, 4=free — see reload_frontend_demo status_cycle).
-  ST1state = fetchStatusFromApi(TABLE_NUM_ST1, 1);
-  ST2state = fetchStatusFromApi(TABLE_NUM_ST2, 1);
-  RT1state = fetchStatusFromApi(TABLE_NUM_RT1, 1);
-  GT1state = fetchStatusFromApi(TABLE_NUM_GT1, 1);
+  ST1state = fetchStatusFromApi(TABLE_NUM_ST1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
+  ST2state = fetchStatusFromApi(TABLE_NUM_ST2, 1, HTTP_GET_BOOT_TIMEOUT_MS);
+  RT1state = fetchStatusFromApi(TABLE_NUM_RT1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
+  GT1state = fetchStatusFromApi(TABLE_NUM_GT1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
+  fetchSt1BookingEndsLocalFromApi();
   setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
   setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
   setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
@@ -421,6 +502,8 @@ void loop() {
   unsigned long now = millis();
   static unsigned long lastPoll = 0;
   static unsigned long lastSlowWork = 0;
+  static uint8_t pollStep = 0;
+  static bool pollCycleActive = false;
   static TableButtonDebouncer st2Btn = {0, 0};
   static TableButtonDebouncer rt1Btn = {0, 0};
   static TableButtonDebouncer gt1Btn = {0, 0};
@@ -431,21 +514,21 @@ void loop() {
     Serial.println("ST2 pressed — cycle status");
     ST2state = (ST2state + 1) % 3;
     setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
-    postStatusToApi(TABLE_NUM_ST2, ST2state);
+    scheduleStatusPost(TABLE_NUM_ST2, ST2state);
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
   if (consumeStableTablePress(RT1buttonPin, rt1Btn, now)) {
     Serial.println("RT1 pressed — cycle status");
     RT1state = (RT1state + 1) % 3;
     setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
-    postStatusToApi(TABLE_NUM_RT1, RT1state);
+    scheduleStatusPost(TABLE_NUM_RT1, RT1state);
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
   if (consumeStableTablePress(GT1buttonPin, gt1Btn, now)) {
     Serial.println("GT1 pressed — cycle status");
     GT1state = (GT1state + 1) % 3;
     setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
-    postStatusToApi(TABLE_NUM_GT1, GT1state);
+    scheduleStatusPost(TABLE_NUM_GT1, GT1state);
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
 
@@ -456,6 +539,9 @@ void loop() {
   }
   lastSlowWork = now;
   now = millis();
+
+  // HTTP after LEDs: one short POST attempt so the fast path never sits in Wi-Fi.
+  drainPendingStatusPost();
 
   unsigned int ADC = scale.get_units();
   float weight = float(ADC) / 2100.00 * 5.00;
@@ -478,11 +564,10 @@ void loop() {
   }
   if ((now - st1CandSince) >= ST1_DEBOUNCE_MS && ST1state != st1Cand) {
     ST1state = st1Cand;
-    postStatusToApi(TABLE_NUM_ST1, ST1state);
+    scheduleStatusPost(TABLE_NUM_ST1, ST1state);
   }
 
   // OLED bus 2 — ST1 line reflects debounced ST1state
-  String endReserveTime = "14:00:00";
   TCA9548A(2);
   display.clearDisplay();
   display.setTextSize(2);
@@ -505,7 +590,7 @@ void loop() {
     display.getTextBounds("00:00:00", 0, 0, &x, &y, &w, &h);
     length = (SCREEN_WIDTH - w) / 2;
     display.setCursor(length, 50);
-    display.print(endReserveTime);
+    display.print(st1BookingEndsLocal);
   } else if (ST1state == 2) {
     display.setTextSize(1);
     display.getTextBounds("RESERVED", 0, 0, &x, &y, &w, &h);
@@ -521,16 +606,36 @@ void loop() {
   }
   display.display();
 
-  if (now - lastPoll >= REMOTE_POLL_MS && now >= suppressPollUntil) {
-    lastPoll = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      // Tables 2–4: buttons + remote (ST1 stays weight-driven only after boot).
-      ST2state = fetchStatusFromApi(TABLE_NUM_ST2, ST2state);
-      RT1state = fetchStatusFromApi(TABLE_NUM_RT1, RT1state);
-      GT1state = fetchStatusFromApi(TABLE_NUM_GT1, GT1state);
-      setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
-      setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
-      setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
+  // Spread remote reads across slow-path visits (one HTTP per loop) so we never
+  // block ~10s+ in a single iteration; LEDs already match local state from presses.
+  if (now >= suppressPollUntil) {
+    if (!pollCycleActive && (unsigned long)(now - lastPoll) >= REMOTE_POLL_MS) {
+      pollCycleActive = true;
+      pollStep = 0;
+    }
+    if (pollCycleActive && WiFi.status() == WL_CONNECTED) {
+      if (pollStep == 0) {
+        fetchSt1BookingEndsLocalFromApi();
+        pollStep = 1;
+      } else if (pollStep == 1) {
+        ST2state = fetchStatusFromApi(TABLE_NUM_ST2, ST2state, HTTP_GET_POLL_TIMEOUT_MS);
+        setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
+        pollStep = 2;
+      } else if (pollStep == 2) {
+        RT1state = fetchStatusFromApi(TABLE_NUM_RT1, RT1state, HTTP_GET_POLL_TIMEOUT_MS);
+        setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
+        pollStep = 3;
+      } else {
+        GT1state = fetchStatusFromApi(TABLE_NUM_GT1, GT1state, HTTP_GET_POLL_TIMEOUT_MS);
+        setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
+        pollStep = 0;
+        pollCycleActive = false;
+        lastPoll = now;
+      }
+    } else if (pollCycleActive && WiFi.status() != WL_CONNECTED) {
+      pollCycleActive = false;
+      pollStep = 0;
+      lastPoll = now;
     }
   }
 
