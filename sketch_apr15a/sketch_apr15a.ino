@@ -16,14 +16,14 @@ struct TableButtonDebouncer {
 };
 
 // Replace with your network credentials (STATION)
-#define ssid "Kakak 4 Bocil"
-#define password "kakaknasmah"
+#define ssid "Lin-2.4GHz"
+#define password "Thet3470"
 
 // Django REST API: use this PC's Wi-Fi IPv4 (ipconfig). Server must listen on all interfaces:
 //   manage.py runserver 0.0.0.0:8001
 // (127.0.0.1-only runserver is unreachable from the ESP32 on the LAN.)
 // If the board uses Host-Only / VM network, try 192.168.56.1 instead.
-#define API_HOST "10.162.47.242"
+#define API_HOST "192.168.0.96"
 #define API_PORT 8001
 // Full path pattern: http://API_HOST:API_PORT/api/iot/table-status/<table_number>/
 
@@ -34,6 +34,9 @@ struct TableButtonDebouncer {
 #define TABLE_NUM_ST2 2
 #define TABLE_NUM_RT1 3
 #define TABLE_NUM_GT1 4
+
+/** Keypad OTP entry length (must match server reservation OTP). */
+#define KEYPAD_PIN_LIMIT 6
 
 #define ST1_DEBOUNCE_MS 600
 #define REMOTE_POLL_MS 2000
@@ -89,6 +92,7 @@ static bool g_st1LastInSeat = false;
 static unsigned long st1FeedbackUntil = 0;
 static uint8_t st1FeedbackKind = 0; /* 0 none, 1 ok, 2 bad */
 static volatile bool g_st1OtpSubmitPending = false;
+static String keypadInputBuffer;
 
 static String makeSt1WeightAvailabilityUrl() {
   return String("http://") + API_HOST + ":" + String(API_PORT) +
@@ -423,7 +427,6 @@ int RT1state;
 int GT1state;
 
 // --- Keypad (4x3): * clear, # submit; rows IO1,2,42,40 cols IO39,47,21 ---
-#define KEYPAD_PIN_LIMIT 6
 static const byte KEYPAD_ROWS = 4;
 static const byte KEYPAD_COLS = 3;
 static char keypadKeys[KEYPAD_ROWS][KEYPAD_COLS] = {
@@ -435,7 +438,6 @@ static byte keypadRowPins[KEYPAD_ROWS] = {1, 2, 42, 40};
 static byte keypadColPins[KEYPAD_COLS] = {39, 47, 21};
 static Keypad keypad =
     Keypad(makeKeymap(keypadKeys), keypadRowPins, keypadColPins, KEYPAD_ROWS, KEYPAD_COLS);
-static String keypadInputBuffer;
 
 static void printCenteredAtY(int py, const char* text) {
   display.getTextBounds(text, 0, 0, &x, &y, &w, &h);
@@ -464,7 +466,7 @@ void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println("Welcome to Library Reservation System ");
-  Serial.println("Keypad: 6-digit reservation OTP, * clear, # submit (when seated at ST1).");
+  Serial.println("Keypad: 6-digit reservation OTP, * clear, # submit (after item on table at ST1).");
 
   // Start I2C: SDA IO8, SCL IO9 (ST1 wiring)
   Wire.begin(8, 9);
@@ -737,11 +739,12 @@ void loop() {
       printCenteredAtY(30, "OTP");
       printCenteredAtY(48, "* clr # send");
     } else {
-      printCenteredAtY(12, "RESERVED");
+      printCenteredAtY(10, "RESERVED");
       char win[24];
       snprintf(win, sizeof(win), "%s - %s", st1BookingStartsLocal, st1BookingWindowEndLocal);
-      printCenteredAtY(28, win);
-      printCenteredAtY(46, "Sit = confirm");
+      printCenteredAtY(24, win);
+      printCenteredAtY(40, "Place item on table");
+      printCenteredAtY(52, "Enter OTP on keypad");
     }
   } else {
     st1FeedbackKind = 0;
