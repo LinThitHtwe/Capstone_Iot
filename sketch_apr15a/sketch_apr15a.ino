@@ -7,6 +7,7 @@
 #include <HTTPClient.h>
 #include <stdio.h>
 #include <string.h>
+#include <Keypad.h>
 
 /** Declared before any function so Arduino's auto-prototypes do not reference an unknown type. */
 struct TableButtonDebouncer {
@@ -22,7 +23,7 @@ struct TableButtonDebouncer {
 //   manage.py runserver 0.0.0.0:8001
 // (127.0.0.1-only runserver is unreachable from the ESP32 on the LAN.)
 // If the board uses Host-Only / VM network, try 192.168.56.1 instead.
-#define API_HOST "10.205.251.117"
+#define API_HOST "10.162.47.242"
 #define API_PORT 8001
 // Full path pattern: http://API_HOST:API_PORT/api/iot/table-status/<table_number>/
 
@@ -79,13 +80,90 @@ static String makeTableStatusUrl(int tableNumber) {
 
 /** ST1 OLED: live reservation end (HH:MM:SS) from Django; default until first GET. */
 static char st1BookingEndsLocal[16] = "--:--:--";
+/** Library-local HH:MM for the booking window shown on OLED (from weight-availability). */
+static char st1BookingStartsLocal[8] = "";
+static char st1BookingWindowEndLocal[8] = "";
+static bool st1OtpVerified = false;
+static bool g_st1LastInSeat = false;
+#define ST1_OTP_FEEDBACK_MS 2200
+static unsigned long st1FeedbackUntil = 0;
+static uint8_t st1FeedbackKind = 0; /* 0 none, 1 ok, 2 bad */
+static volatile bool g_st1OtpSubmitPending = false;
 
 static String makeSt1WeightAvailabilityUrl() {
   return String("http://") + API_HOST + ":" + String(API_PORT) +
          "/api/public/tables/1/weight-availability/";
 }
 
-static void fetchSt1BookingEndsLocalFromApi() {
+static String makeSt1VerifyOtpUrl() {
+  return String("http://") + API_HOST + ":" + String(API_PORT) +
+         "/api/iot/tables/" + String(TABLE_NUM_ST1) + "/verify-reservation-otp/";
+}
+
+/** After ``"key":`` — copy quoted string into ``out``, or clear on JSON null. */
+static void parseJsonStringField(const String& body, const char* key, char* out, size_t outSz) {
+  String needle = String("\"") + key + "\":";
+  int i = body.indexOf(needle);
+  if (i < 0) {
+    if (outSz > 0) out[0] = '\0';
+    return;
+  }
+  i += needle.length();
+  while (i < (int)body.length() && (body.charAt(i) == ' ' || body.charAt(i) == '\n')) i++;
+  if (i < (int)body.length() && body.charAt(i) == 'n') {
+    if (outSz > 0) out[0] = '\0';
+    return;
+  }
+  if (i >= (int)body.length() || body.charAt(i) != '"') {
+    if (outSz > 0) out[0] = '\0';
+    return;
+  }
+  i++;
+  int j = 0;
+  while (i < (int)body.length() && body.charAt(i) != '"' && j < (int)outSz - 1) {
+    out[j++] = (char)body.charAt(i++);
+  }
+  out[j] = '\0';
+}
+
+static bool parseJsonBoolTrue(const String& body, const char* key) {
+  String needle = String("\"") + key + "\":";
+  int i = body.indexOf(needle);
+  if (i < 0) return false;
+  i += needle.length();
+  while (i < (int)body.length() && body.charAt(i) == ' ') i++;
+  return i < (int)body.length() && body.charAt(i) == 't';
+}
+
+static bool st1HasBookingWindowForUi() {
+  return st1BookingStartsLocal[0] != '\0' && st1BookingWindowEndLocal[0] != '\0';
+}
+
+static bool st1ShouldSuppressFreeStatusPost() {
+  if (!st1HasBookingWindowForUi()) return false;
+  if (st1OtpVerified) return false;
+  return true;
+}
+
+static bool postVerifyOtpToApi() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (keypadInputBuffer.length() != KEYPAD_PIN_LIMIT) return false;
+  HTTPClient http;
+  String url = makeSt1VerifyOtpUrl();
+  http.setTimeout(HTTP_GET_BOOT_TIMEOUT_MS);
+  if (!http.begin(url)) {
+    Serial.println("st1 verify: http.begin failed");
+    return false;
+  }
+  http.addHeader("Content-Type", "application/json");
+  String body = String("{\"otp\":\"") + keypadInputBuffer + "\"}";
+  int code = http.POST(body);
+  http.end();
+  Serial.printf("st1 verify POST code=%d\n", code);
+  return code >= 200 && code < 300;
+}
+
+static void fetchSt1WeightAvailabilityFromApi() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
   String url = makeSt1WeightAvailabilityUrl();
@@ -102,29 +180,33 @@ static void fetchSt1BookingEndsLocalFromApi() {
   }
   String body = http.getString();
   http.end();
-  const char* key = "\"current_booking_ends_local\":";
-  int i = body.indexOf(key);
-  if (i < 0) {
-    Serial.println("st1 avail: key not found");
-    return;
+
+  bool hasSensor = true;
+  if (body.indexOf("\"has_weight_sensor\":") >= 0) {
+    hasSensor = parseJsonBoolTrue(body, "has_weight_sensor");
   }
-  i += (int)strlen(key);
-  while (i < (int)body.length() && body.charAt(i) == ' ') i++;
-  if (i < (int)body.length() && body.charAt(i) == 'n') {
+  if (!hasSensor) {
+    st1BookingStartsLocal[0] = '\0';
+    st1BookingWindowEndLocal[0] = '\0';
+    st1OtpVerified = false;
     strncpy(st1BookingEndsLocal, "--:--:--", sizeof(st1BookingEndsLocal));
     st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
     return;
   }
-  if (i >= (int)body.length() || body.charAt(i) != '"') return;
-  i++;
-  int j = 0;
-  while (i < (int)body.length() && body.charAt(i) != '"' &&
-         j < (int)sizeof(st1BookingEndsLocal) - 1) {
-    st1BookingEndsLocal[j++] = (char)body.charAt(i++);
-  }
-  st1BookingEndsLocal[j] = '\0';
-  if (j == 0) {
+
+  parseJsonStringField(body, "current_booking_starts_local", st1BookingStartsLocal,
+                       sizeof(st1BookingStartsLocal));
+  parseJsonStringField(body, "current_booking_window_end_local", st1BookingWindowEndLocal,
+                       sizeof(st1BookingWindowEndLocal));
+  st1OtpVerified = parseJsonBoolTrue(body, "otp_verified");
+
+  char endsBuf[sizeof(st1BookingEndsLocal)];
+  parseJsonStringField(body, "current_booking_ends_local", endsBuf, sizeof(endsBuf));
+  if (endsBuf[0] == '\0') {
     strncpy(st1BookingEndsLocal, "--:--:--", sizeof(st1BookingEndsLocal));
+    st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
+  } else {
+    strncpy(st1BookingEndsLocal, endsBuf, sizeof(st1BookingEndsLocal));
     st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
   }
 }
@@ -314,31 +396,46 @@ uint16_t w, h;
 
 //initialize HX711 object
 // HX711 circuit wiring
-const int LOADCELL_DOUT_PIN = 12;
-const int LOADCELL_SCK_PIN = 13;
+const int LOADCELL_DOUT_PIN = 10;  // ST1 DT: IO10
+const int LOADCELL_SCK_PIN = 11;  // ST1 SCK: IO11
 HX711 scale;
 float calibration_factor = -1365; // for me this vlaue works just perfect 419640
 
 
 //Variable will not change for
-const int ST2buttonPin = 26;  // the number of the pushbutton pin
-const int RT1buttonPin = 27;
-const int GT1buttonPin = 14;
+const int ST2buttonPin = 38;  // ST2 button: IO38
+const int RT1buttonPin = 19;   // RT1 button: IO7
+const int GT1buttonPin = 18;  // GT1 button: IO18
 
-const int ST2ledPinR =  25;    // the number of the LED pin
-const int ST2ledPinG =  33;    // led R: Unavailable, Led G: Available
-const int ST2ledPinB =  32;    // Led B: Reserved
-const int RT1ledPinR =  19;
-const int RT1ledPinG =  18;
-const int RT1ledPinB =  5;
-const int GT1ledPinR =  4;
-const int GT1ledPinG =  2;
-const int GT1ledPinB =  15;
+const int ST2ledPinR =  14;   // ST2 R: IO14
+const int ST2ledPinG =  13;   // ST2 G: IO13
+const int ST2ledPinB =  12;   // ST2 B: IO12
+const int RT1ledPinR =  4;    // RT1 R: IO4
+const int RT1ledPinG =  5;    // RT1 G: IO5
+const int RT1ledPinB =  6;    // RT1 B: IO6
+const int GT1ledPinR =  15;   // GT1 R: IO15
+const int GT1ledPinG =  16;   // GT1 G: IO16
+const int GT1ledPinB =  17;   // GT1 B: IO17
 
 int ST1state; // 0: unavailable, 1: available, 2: reserved
 int ST2state;
 int RT1state;
 int GT1state;
+
+// --- Keypad (4x3): * clear, # submit; rows IO1,2,42,40 cols IO39,47,21 ---
+#define KEYPAD_PIN_LIMIT 6
+static const byte KEYPAD_ROWS = 4;
+static const byte KEYPAD_COLS = 3;
+static char keypadKeys[KEYPAD_ROWS][KEYPAD_COLS] = {
+    {'1', '2', '3'},
+    {'4', '5', '6'},
+    {'7', '8', '9'},
+    {'*', '0', '#'}};
+static byte keypadRowPins[KEYPAD_ROWS] = {1, 2, 42, 40};
+static byte keypadColPins[KEYPAD_COLS] = {39, 47, 21};
+static Keypad keypad =
+    Keypad(makeKeymap(keypadKeys), keypadRowPins, keypadColPins, KEYPAD_ROWS, KEYPAD_COLS);
+static String keypadInputBuffer;
 
 static void printCenteredAtY(int py, const char* text) {
   display.getTextBounds(text, 0, 0, &x, &y, &w, &h);
@@ -367,9 +464,10 @@ void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println("Welcome to Library Reservation System ");
+  Serial.println("Keypad: 6-digit reservation OTP, * clear, # submit (when seated at ST1).");
 
-  // Start I2C communication with the Multiplexer for OLED
-  Wire.begin();
+  // Start I2C: SDA IO8, SCL IO9 (ST1 wiring)
+  Wire.begin(8, 9);
 
     // Init OLED display on bus number 2
   TCA9548A(2);
@@ -413,7 +511,7 @@ void setup() {
   ST2state = fetchStatusFromApi(TABLE_NUM_ST2, 1, HTTP_GET_BOOT_TIMEOUT_MS);
   RT1state = fetchStatusFromApi(TABLE_NUM_RT1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
   GT1state = fetchStatusFromApi(TABLE_NUM_GT1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
-  fetchSt1BookingEndsLocalFromApi();
+  fetchSt1WeightAvailabilityFromApi();
   setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
   setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
   setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
@@ -532,6 +630,27 @@ void loop() {
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
 
+  char key = keypad.getKey();
+  if (key) {
+    if (key == '#') {
+      if (keypadInputBuffer.length() == KEYPAD_PIN_LIMIT) {
+        g_st1OtpSubmitPending = true;
+      } else {
+        Serial.println("\nEnter 6 digits then #.");
+      }
+    } else if (key == '*') {
+      keypadInputBuffer = "";
+      Serial.println("\nCleared.");
+    } else {
+      if (keypadInputBuffer.length() < KEYPAD_PIN_LIMIT) {
+        keypadInputBuffer += key;
+        Serial.print(key);
+      } else {
+        Serial.println("\n[Limit reached! Press # to submit]");
+      }
+    }
+  }
+
   // Let debouncers advance in real time: HX711 + OLED + poll are deferred to a throttled block.
   if ((unsigned long)(now - lastSlowWork) < (unsigned long)SLOW_LOOP_PERIOD_MS) {
     delay(1);
@@ -543,12 +662,30 @@ void loop() {
   // HTTP after LEDs: one short POST attempt so the fast path never sits in Wi-Fi.
   drainPendingStatusPost();
 
+  if (g_st1OtpSubmitPending) {
+    g_st1OtpSubmitPending = false;
+    if (keypadInputBuffer.length() == KEYPAD_PIN_LIMIT) {
+      if (postVerifyOtpToApi()) {
+        st1FeedbackKind = 1;
+        st1FeedbackUntil = now + ST1_OTP_FEEDBACK_MS;
+        keypadInputBuffer = "";
+        fetchSt1WeightAvailabilityFromApi();
+      } else {
+        st1FeedbackKind = 2;
+        st1FeedbackUntil = now + ST1_OTP_FEEDBACK_MS;
+        keypadInputBuffer = "";
+      }
+    }
+  }
+
   unsigned int ADC = scale.get_units();
   float weight = float(ADC) / 2100.00 * 5.00;
   Serial.print("ADC = ");
   Serial.print(ADC);
   Serial.print(", weight = ");
   Serial.println(weight);
+
+  g_st1LastInSeat = (weight >= 2.00f);
 
   // ST1: HX711 -> debounced IoT state 0/1 -> POST (2=reserved not used from weight)
   static int st1Cand = -1;
@@ -564,10 +701,13 @@ void loop() {
   }
   if ((now - st1CandSince) >= ST1_DEBOUNCE_MS && ST1state != st1Cand) {
     ST1state = st1Cand;
-    scheduleStatusPost(TABLE_NUM_ST1, ST1state);
+    const bool suppressPost = (ST1state == 1) && st1ShouldSuppressFreeStatusPost();
+    if (!suppressPost) {
+      scheduleStatusPost(TABLE_NUM_ST1, ST1state);
+    }
   }
 
-  // OLED bus 2 — ST1 line reflects debounced ST1state
+  // OLED bus 2 — ST1: reservation + OTP flow when API reports a booking window
   TCA9548A(2);
   display.clearDisplay();
   display.setTextSize(2);
@@ -575,34 +715,65 @@ void loop() {
   length = (SCREEN_WIDTH - w) / 2;
   display.setCursor(length, 0);
   display.print("ST 1");
-  if (ST1state == 0) {
+  if (st1FeedbackKind != 0 && (unsigned long)now < st1FeedbackUntil) {
     display.setTextSize(1);
-    display.getTextBounds("UNAVAILABLE", 0, 0, &x, &y, &w, &h);
-    length = (SCREEN_WIDTH - w) / 2;
-    display.setCursor(length, 20);
-    display.print("UNAVAILABLE");
+    if (st1FeedbackKind == 1) {
+      printCenteredAtY(22, "RESERVED OK");
+      printCenteredAtY(38, "OTP ACCEPTED");
+    } else {
+      printCenteredAtY(30, "WRONG OTP");
+    }
+  } else if (st1HasBookingWindowForUi()) {
+    st1FeedbackKind = 0;
     display.setTextSize(1);
-    display.getTextBounds("WILL AVAILABLE AT", 0, 0, &x, &y, &w, &h);
-    length = (SCREEN_WIDTH - w) / 2;
-    display.setCursor(length, 30);
-    display.print("WILL AVAILABLE AT");
-    display.setTextSize(2);
-    display.getTextBounds("00:00:00", 0, 0, &x, &y, &w, &h);
-    length = (SCREEN_WIDTH - w) / 2;
-    display.setCursor(length, 50);
-    display.print(st1BookingEndsLocal);
-  } else if (ST1state == 2) {
-    display.setTextSize(1);
-    display.getTextBounds("RESERVED", 0, 0, &x, &y, &w, &h);
-    length = (SCREEN_WIDTH - w) / 2;
-    display.setCursor(length, 25);
-    display.print("RESERVED");
+    if (st1OtpVerified) {
+      printCenteredAtY(14, "RESERVED");
+      printCenteredAtY(26, "CONFIRMED");
+      char bufAvail[40];
+      snprintf(bufAvail, sizeof(bufAvail), "Avail until %s", st1BookingWindowEndLocal);
+      printCenteredAtY(44, bufAvail);
+    } else if (g_st1LastInSeat) {
+      printCenteredAtY(16, "PLEASE ENTER");
+      printCenteredAtY(30, "OTP");
+      printCenteredAtY(48, "* clr # send");
+    } else {
+      printCenteredAtY(12, "RESERVED");
+      char win[24];
+      snprintf(win, sizeof(win), "%s - %s", st1BookingStartsLocal, st1BookingWindowEndLocal);
+      printCenteredAtY(28, win);
+      printCenteredAtY(46, "Sit = confirm");
+    }
   } else {
-    display.setTextSize(1);
-    display.getTextBounds("AVAILABLE", 0, 0, &x, &y, &w, &h);
-    length = (SCREEN_WIDTH - w) / 2;
-    display.setCursor(length, 25);
-    display.print("AVAILABLE");
+    st1FeedbackKind = 0;
+    if (ST1state == 0) {
+      display.setTextSize(1);
+      display.getTextBounds("UNAVAILABLE", 0, 0, &x, &y, &w, &h);
+      length = (SCREEN_WIDTH - w) / 2;
+      display.setCursor(length, 20);
+      display.print("UNAVAILABLE");
+      display.setTextSize(1);
+      display.getTextBounds("WILL AVAILABLE AT", 0, 0, &x, &y, &w, &h);
+      length = (SCREEN_WIDTH - w) / 2;
+      display.setCursor(length, 30);
+      display.print("WILL AVAILABLE AT");
+      display.setTextSize(2);
+      display.getTextBounds("00:00:00", 0, 0, &x, &y, &w, &h);
+      length = (SCREEN_WIDTH - w) / 2;
+      display.setCursor(length, 50);
+      display.print(st1BookingEndsLocal);
+    } else if (ST1state == 2) {
+      display.setTextSize(1);
+      display.getTextBounds("RESERVED", 0, 0, &x, &y, &w, &h);
+      length = (SCREEN_WIDTH - w) / 2;
+      display.setCursor(length, 25);
+      display.print("RESERVED");
+    } else {
+      display.setTextSize(1);
+      display.getTextBounds("AVAILABLE", 0, 0, &x, &y, &w, &h);
+      length = (SCREEN_WIDTH - w) / 2;
+      display.setCursor(length, 25);
+      display.print("AVAILABLE");
+    }
   }
   display.display();
 
@@ -615,7 +786,7 @@ void loop() {
     }
     if (pollCycleActive && WiFi.status() == WL_CONNECTED) {
       if (pollStep == 0) {
-        fetchSt1BookingEndsLocalFromApi();
+        fetchSt1WeightAvailabilityFromApi();
         pollStep = 1;
       } else if (pollStep == 1) {
         ST2state = fetchStatusFromApi(TABLE_NUM_ST2, ST2state, HTTP_GET_POLL_TIMEOUT_MS);
