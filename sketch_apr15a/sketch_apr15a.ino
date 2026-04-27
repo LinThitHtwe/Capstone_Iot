@@ -87,12 +87,16 @@ static char st1BookingEndsLocal[16] = "--:--:--";
 static char st1BookingStartsLocal[8] = "";
 static char st1BookingWindowEndLocal[8] = "";
 static bool st1OtpVerified = false;
-static bool g_st1LastInSeat = false;
 #define ST1_OTP_FEEDBACK_MS 2200
+#define ST1_LOCKOUT_MS 30000UL
 static unsigned long st1FeedbackUntil = 0;
 static uint8_t st1FeedbackKind = 0; /* 0 none, 1 ok, 2 bad */
 static volatile bool g_st1OtpSubmitPending = false;
 static String keypadInputBuffer;
+static uint8_t st1WrongCount = 0;
+static unsigned long st1LockoutUntil = 0;
+/** Last strike count (1–3) shown on OLED during WRONG OTP flash. */
+static uint8_t st1WrongStrikeShown = 0;
 
 static String makeSt1WeightAvailabilityUrl() {
   return String("http://") + API_HOST + ":" + String(API_PORT) +
@@ -162,9 +166,19 @@ static bool postVerifyOtpToApi() {
   http.addHeader("Content-Type", "application/json");
   String body = String("{\"otp\":\"") + keypadInputBuffer + "\"}";
   int code = http.POST(body);
+  String resp = (code > 0) ? http.getString() : String();
   http.end();
   Serial.printf("st1 verify POST code=%d\n", code);
-  return code >= 200 && code < 300;
+  if (code < 200 || code >= 300) {
+    Serial.println(resp);
+    return false;
+  }
+  /* Require JSON success body (4xx can be mis-reported by some proxies as 200). */
+  if (resp.indexOf("\"detail\":\"ok\"") < 0 && resp.indexOf("\"detail\": \"ok\"") < 0) {
+    Serial.println(resp);
+    return false;
+  }
+  return true;
 }
 
 static void fetchSt1WeightAvailabilityFromApi() {
@@ -195,14 +209,33 @@ static void fetchSt1WeightAvailabilityFromApi() {
     st1OtpVerified = false;
     strncpy(st1BookingEndsLocal, "--:--:--", sizeof(st1BookingEndsLocal));
     st1BookingEndsLocal[sizeof(st1BookingEndsLocal) - 1] = '\0';
+    st1WrongCount = 0;
+    st1LockoutUntil = 0;
+    keypadInputBuffer = "";
     return;
   }
+
+  char prevStart[sizeof(st1BookingStartsLocal)];
+  char prevWinEnd[sizeof(st1BookingWindowEndLocal)];
+  strncpy(prevStart, st1BookingStartsLocal, sizeof(prevStart));
+  prevStart[sizeof(prevStart) - 1] = '\0';
+  strncpy(prevWinEnd, st1BookingWindowEndLocal, sizeof(prevWinEnd));
+  prevWinEnd[sizeof(prevWinEnd) - 1] = '\0';
 
   parseJsonStringField(body, "current_booking_starts_local", st1BookingStartsLocal,
                        sizeof(st1BookingStartsLocal));
   parseJsonStringField(body, "current_booking_window_end_local", st1BookingWindowEndLocal,
                        sizeof(st1BookingWindowEndLocal));
   st1OtpVerified = parseJsonBoolTrue(body, "otp_verified");
+
+  const bool windowChanged =
+      (strcmp(prevStart, st1BookingStartsLocal) != 0) ||
+      (strcmp(prevWinEnd, st1BookingWindowEndLocal) != 0);
+  if (st1BookingStartsLocal[0] == '\0' || windowChanged) {
+    st1WrongCount = 0;
+    st1LockoutUntil = 0;
+    keypadInputBuffer = "";
+  }
 
   char endsBuf[sizeof(st1BookingEndsLocal)];
   parseJsonStringField(body, "current_booking_ends_local", endsBuf, sizeof(endsBuf));
@@ -426,7 +459,7 @@ int ST2state;
 int RT1state;
 int GT1state;
 
-// --- Keypad (4x3): * clear, # submit; rows IO1,2,42,40 cols IO39,47,21 ---
+// --- Keypad (4x3): * clear, 6 digits auto-submit; rows IO1,2,42,40 cols IO39,47,21 ---
 static const byte KEYPAD_ROWS = 4;
 static const byte KEYPAD_COLS = 3;
 static char keypadKeys[KEYPAD_ROWS][KEYPAD_COLS] = {
@@ -446,12 +479,42 @@ static void printCenteredAtY(int py, const char* text) {
   display.print(text);
 }
 
+/** One-line ST1 OLED title: ``ST1 (INNER)`` at text size 1. */
+static void st1PrintHeader(const char* inner) {
+  char buf[24];
+  snprintf(buf, sizeof(buf), "ST1 (%s)", inner);
+  display.setTextSize(1);
+  printCenteredAtY(0, buf);
+}
+
+/** Six-char OTP line at text size 2: typed digits shown, empty slots ``_``. */
+static void st1PrintOtpProgressAtY(int py) {
+  char line[8];
+  const int n = keypadInputBuffer.length();
+  for (int i = 0; i < KEYPAD_PIN_LIMIT; i++) {
+    if (i < n) {
+      char c = keypadInputBuffer.charAt(i);
+      line[i] = (c >= '0' && c <= '9') ? c : '_';
+    } else {
+      line[i] = '_';
+    }
+  }
+  line[KEYPAD_PIN_LIMIT] = '\0';
+  display.setTextSize(2);
+  display.getTextBounds(line, 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(length, py);
+  display.print(line);
+}
+
 static void refreshDisplay2() {
   TCA9548A(3);
   display.clearDisplay();
   display.setTextSize(1);
   char buf[24];
-  snprintf(buf, sizeof(buf), "ST 1: %s", iotStatusLabel(ST1state));
+  const char* st1Label =
+      st1HasBookingWindowForUi() ? "Reserved" : iotStatusLabel(ST1state);
+  snprintf(buf, sizeof(buf), "ST 1: %s", st1Label);
   printCenteredAtY(0, buf);
   snprintf(buf, sizeof(buf), "ST 2: %s", iotStatusLabel(ST2state));
   printCenteredAtY(15, buf);
@@ -466,7 +529,7 @@ void setup() {
   // put your setup code here, to run once:
   Serial.begin(115200);
   Serial.println("Welcome to Library Reservation System ");
-  Serial.println("Keypad: 6-digit reservation OTP, * clear, # submit (after item on table at ST1).");
+  Serial.println("Keypad: 6-digit reservation OTP auto-sends; * clears.");
 
   // Start I2C: SDA IO8, SCL IO9 (ST1 wiring)
   Wire.begin(8, 9);
@@ -634,21 +697,23 @@ void loop() {
 
   char key = keypad.getKey();
   if (key) {
-    if (key == '#') {
-      if (keypadInputBuffer.length() == KEYPAD_PIN_LIMIT) {
-        g_st1OtpSubmitPending = true;
-      } else {
-        Serial.println("\nEnter 6 digits then #.");
-      }
+    const unsigned long kNow = millis();
+    const bool keypadBlocked =
+        g_st1OtpSubmitPending ||
+        (st1FeedbackKind != 0 && (unsigned long)kNow < st1FeedbackUntil) ||
+        ((unsigned long)kNow < st1LockoutUntil);
+    if (keypadBlocked) {
+      /* drop input during verify / feedback flash / lockout */
+    } else if (key == '#') {
+      /* ignored: OTP submits automatically after 6 digits */
     } else if (key == '*') {
       keypadInputBuffer = "";
-      Serial.println("\nCleared.");
-    } else {
+    } else if (key >= '0' && key <= '9') {
       if (keypadInputBuffer.length() < KEYPAD_PIN_LIMIT) {
         keypadInputBuffer += key;
-        Serial.print(key);
-      } else {
-        Serial.println("\n[Limit reached! Press # to submit]");
+        if (keypadInputBuffer.length() == KEYPAD_PIN_LIMIT) {
+          g_st1OtpSubmitPending = true;
+        }
       }
     }
   }
@@ -668,11 +733,19 @@ void loop() {
     g_st1OtpSubmitPending = false;
     if (keypadInputBuffer.length() == KEYPAD_PIN_LIMIT) {
       if (postVerifyOtpToApi()) {
+        st1WrongCount = 0;
+        st1LockoutUntil = 0;
         st1FeedbackKind = 1;
         st1FeedbackUntil = now + ST1_OTP_FEEDBACK_MS;
         keypadInputBuffer = "";
         fetchSt1WeightAvailabilityFromApi();
       } else {
+        st1WrongCount++;
+        st1WrongStrikeShown = st1WrongCount;
+        if (st1WrongCount >= 3) {
+          st1LockoutUntil = now + ST1_LOCKOUT_MS;
+          st1WrongCount = 0;
+        }
         st1FeedbackKind = 2;
         st1FeedbackUntil = now + ST1_OTP_FEEDBACK_MS;
         keypadInputBuffer = "";
@@ -686,8 +759,6 @@ void loop() {
   Serial.print(ADC);
   Serial.print(", weight = ");
   Serial.println(weight);
-
-  g_st1LastInSeat = (weight >= 2.00f);
 
   // ST1: HX711 -> debounced IoT state 0/1 -> POST (2=reserved not used from weight)
   static int st1Cand = -1;
@@ -712,70 +783,66 @@ void loop() {
   // OLED bus 2 — ST1: reservation + OTP flow when API reports a booking window
   TCA9548A(2);
   display.clearDisplay();
-  display.setTextSize(2);
-  display.getTextBounds("ST 1", 0, 0, &x, &y, &w, &h);
-  length = (SCREEN_WIDTH - w) / 2;
-  display.setCursor(length, 0);
-  display.print("ST 1");
+
   if (st1FeedbackKind != 0 && (unsigned long)now < st1FeedbackUntil) {
-    display.setTextSize(1);
     if (st1FeedbackKind == 1) {
-      printCenteredAtY(22, "RESERVED OK");
-      printCenteredAtY(38, "OTP ACCEPTED");
+      st1PrintHeader("UNAVAILABLE");
+      display.setTextSize(1);
+      printCenteredAtY(28, "OTP ACCEPTED");
     } else {
-      printCenteredAtY(30, "WRONG OTP");
+      st1PrintHeader("RESERVED");
+      char wline[22];
+      snprintf(wline, sizeof(wline), "WRONG OTP %u/3", (unsigned)st1WrongStrikeShown);
+      printCenteredAtY(22, wline);
+      printCenteredAtY(38, "Try again");
     }
+  } else if (st1HasBookingWindowForUi() && !st1OtpVerified &&
+             (unsigned long)now < st1LockoutUntil) {
+    st1PrintHeader("RESERVED");
+    display.setTextSize(1);
+    printCenteredAtY(18, "TOO MANY TRIES");
+    char lb[28];
+    const unsigned long remSec = (st1LockoutUntil - now) / 1000UL;
+    snprintf(lb, sizeof(lb), "Try again in %lus", remSec);
+    printCenteredAtY(34, lb);
+    char win[24];
+    snprintf(win, sizeof(win), "%s - %s", st1BookingStartsLocal, st1BookingWindowEndLocal);
+    printCenteredAtY(50, win);
   } else if (st1HasBookingWindowForUi()) {
     st1FeedbackKind = 0;
-    display.setTextSize(1);
     if (st1OtpVerified) {
-      printCenteredAtY(14, "RESERVED");
-      printCenteredAtY(26, "CONFIRMED");
-      char bufAvail[40];
-      snprintf(bufAvail, sizeof(bufAvail), "Avail until %s", st1BookingWindowEndLocal);
-      printCenteredAtY(44, bufAvail);
-    } else if (g_st1LastInSeat) {
-      printCenteredAtY(16, "PLEASE ENTER");
-      printCenteredAtY(30, "OTP");
-      printCenteredAtY(48, "* clr # send");
+      st1PrintHeader("UNAVAILABLE");
+      display.setTextSize(1);
+      printCenteredAtY(22, "until");
+      display.setTextSize(2);
+      printCenteredAtY(38, st1BookingWindowEndLocal);
     } else {
-      printCenteredAtY(10, "RESERVED");
-      char win[24];
-      snprintf(win, sizeof(win), "%s - %s", st1BookingStartsLocal, st1BookingWindowEndLocal);
-      printCenteredAtY(24, win);
-      printCenteredAtY(40, "Place item on table");
-      printCenteredAtY(52, "Enter OTP on keypad");
+      st1PrintHeader("RESERVED");
+      display.setTextSize(1);
+      printCenteredAtY(16, "Enter 6-digit OTP");
+      st1PrintOtpProgressAtY(28);
+      display.setTextSize(1);
+      char winOtp[24];
+      snprintf(winOtp, sizeof(winOtp), "%s - %s", st1BookingStartsLocal, st1BookingWindowEndLocal);
+      printCenteredAtY(52, winOtp);
     }
   } else {
     st1FeedbackKind = 0;
     if (ST1state == 0) {
+      st1PrintHeader("UNAVAILABLE");
       display.setTextSize(1);
-      display.getTextBounds("UNAVAILABLE", 0, 0, &x, &y, &w, &h);
-      length = (SCREEN_WIDTH - w) / 2;
-      display.setCursor(length, 20);
-      display.print("UNAVAILABLE");
-      display.setTextSize(1);
-      display.getTextBounds("WILL AVAILABLE AT", 0, 0, &x, &y, &w, &h);
-      length = (SCREEN_WIDTH - w) / 2;
-      display.setCursor(length, 30);
-      display.print("WILL AVAILABLE AT");
+      printCenteredAtY(18, "WILL AVAILABLE AT");
       display.setTextSize(2);
-      display.getTextBounds("00:00:00", 0, 0, &x, &y, &w, &h);
-      length = (SCREEN_WIDTH - w) / 2;
-      display.setCursor(length, 50);
-      display.print(st1BookingEndsLocal);
+      printCenteredAtY(36, st1BookingEndsLocal);
     } else if (ST1state == 2) {
+      st1PrintHeader("RESERVED");
       display.setTextSize(1);
-      display.getTextBounds("RESERVED", 0, 0, &x, &y, &w, &h);
-      length = (SCREEN_WIDTH - w) / 2;
-      display.setCursor(length, 25);
-      display.print("RESERVED");
+      printCenteredAtY(30, "Standby");
     } else {
+      display.setTextSize(2);
+      printCenteredAtY(14, "ST1");
       display.setTextSize(1);
-      display.getTextBounds("AVAILABLE", 0, 0, &x, &y, &w, &h);
-      length = (SCREEN_WIDTH - w) / 2;
-      display.setCursor(length, 25);
-      display.print("AVAILABLE");
+      printCenteredAtY(44, "Available");
     }
   }
   display.display();
