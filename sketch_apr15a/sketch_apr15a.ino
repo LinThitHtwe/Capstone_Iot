@@ -753,12 +753,16 @@ void loop() {
     }
   }
 
-  unsigned int ADC = scale.get_units();
-  float weight = float(ADC) / 2100.00 * 5.00;
-  Serial.print("ADC = ");
-  Serial.print(ADC);
+  /* get_units() is float; casting to unsigned wraps negatives to huge values → always "seated". */
+  float reading = scale.get_units();
+  if (reading < 0.0f) {
+    reading = 0.0f;
+  }
+  float weight = reading / 2100.00f * 5.00f;
+  Serial.print("reading = ");
+  Serial.print(reading, 3);
   Serial.print(", weight = ");
-  Serial.println(weight);
+  Serial.println(weight, 3);
 
   // ST1: HX711 -> debounced IoT state 0/1 -> POST (2=reserved not used from weight)
   static int st1Cand = -1;
