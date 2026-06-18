@@ -16,14 +16,14 @@ struct TableButtonDebouncer {
 };
 
 // Replace with your network credentials (STATION)
-#define ssid "Lin-2.4GHz"
-#define password "Thet3470"
+#define ssid "Kakak 4 Bocil"
+#define password "kakaknasmah"
 
 // Django REST API: use this PC's Wi-Fi IPv4 (ipconfig). Server must listen on all interfaces:
 //   manage.py runserver 0.0.0.0:8001
 // (127.0.0.1-only runserver is unreachable from the ESP32 on the LAN.)
 // If the board uses Host-Only / VM network, try 192.168.56.1 instead.
-#define API_HOST "192.168.0.96"
+#define API_HOST "10.162.47.242"
 #define API_PORT 8001
 // Full path pattern: http://API_HOST:API_PORT/api/iot/table-status/<table_number>/
 
