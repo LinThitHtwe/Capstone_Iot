@@ -1,35 +1,28 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
-
-//Insert Wifi library
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <stdio.h>
 #include <string.h>
 #include <Keypad.h>
 
-/** Declared before any function so Arduino's auto-prototypes do not reference an unknown type. */
+/** Declared early so Arduino auto-prototypes see this type. */
 struct TableButtonDebouncer {
   uint8_t phase; /* 0 = armed (released), 1 = latched until full release */
   unsigned long mark;
 };
 
-// Replace with your network credentials (STATION)
-#define ssid "Kakak 4 Bocil"
-#define password "kakaknasmah"
+// Wi-Fi credentials (station mode)
+#define ssid "YOUR_WIFI_SSID"
+#define password "YOUR_WIFI_PASSWORD"
 
-// Django REST API: use this PC's Wi-Fi IPv4 (ipconfig). Server must listen on all interfaces:
-//   manage.py runserver 0.0.0.0:8001
-// (127.0.0.1-only runserver is unreachable from the ESP32 on the LAN.)
-// If the board uses Host-Only / VM network, try 192.168.56.1 instead.
-#define API_HOST "10.162.47.242"
+// Django API host: PC LAN IPv4 (ipconfig / ifconfig). Run:
+//   python manage.py runserver 0.0.0.0:8001
+#define API_HOST "192.168.1.100"
 #define API_PORT 8001
-// Full path pattern: http://API_HOST:API_PORT/api/iot/table-status/<table_number>/
 
-// Django Table.table_number (not DB row id). Must match the first four entries from
-// ``reload_frontend_demo`` / ``capstone-frontend/lib/data/admin-tables-mock.ts``:
-// floor 1 scatter coords (40,45)→1, (200,38)→2, (380,62)→3, (560,44)→4.
+// Django Table.table_number values for the four wired seats (not DB row ids).
 #define TABLE_NUM_ST1 1
 #define TABLE_NUM_ST2 2
 #define TABLE_NUM_RT1 3
@@ -160,7 +153,6 @@ static bool postVerifyOtpToApi() {
   String url = makeSt1VerifyOtpUrl();
   http.setTimeout(HTTP_GET_BOOT_TIMEOUT_MS);
   if (!http.begin(url)) {
-    Serial.println("st1 verify: http.begin failed");
     return false;
   }
   http.addHeader("Content-Type", "application/json");
@@ -168,14 +160,11 @@ static bool postVerifyOtpToApi() {
   int code = http.POST(body);
   String resp = (code > 0) ? http.getString() : String();
   http.end();
-  Serial.printf("st1 verify POST code=%d\n", code);
   if (code < 200 || code >= 300) {
-    Serial.println(resp);
     return false;
   }
   /* Require JSON success body (4xx can be mis-reported by some proxies as 200). */
   if (resp.indexOf("\"detail\":\"ok\"") < 0 && resp.indexOf("\"detail\": \"ok\"") < 0) {
-    Serial.println(resp);
     return false;
   }
   return true;
@@ -187,12 +176,10 @@ static void fetchSt1WeightAvailabilityFromApi() {
   String url = makeSt1WeightAvailabilityUrl();
   http.setTimeout(HTTP_GET_POLL_TIMEOUT_MS);
   if (!http.begin(url)) {
-    Serial.println("st1 avail: http.begin failed");
     return;
   }
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("st1 avail GET code=%d\n", code);
     http.end();
     return;
   }
@@ -275,12 +262,10 @@ static int fetchStatusFromApi(int tableNumber, int defaultIot, uint32_t getTimeo
   String url = makeTableStatusUrl(tableNumber);
   http.setTimeout(getTimeoutMs);
   if (!http.begin(url)) {
-    Serial.println("http.begin failed");
     return defaultIot;
   }
   int code = http.GET();
   if (code != 200) {
-    Serial.printf("GET %s code=%d\n", url.c_str(), code);
     http.end();
     return defaultIot;
   }
@@ -288,7 +273,6 @@ static int fetchStatusFromApi(int tableNumber, int defaultIot, uint32_t getTimeo
   http.end();
   int raw = parseStatusJson(body);
   if (raw < 0) {
-    Serial.println("parseStatusJson failed: " + body);
     return defaultIot;
   }
   return iotStatusFromApi(raw);
@@ -307,17 +291,14 @@ static bool postStatusToApiWithConfig(
     HTTPClient http;
     http.setTimeout(timeoutMs);
     if (!http.begin(url)) {
-      Serial.println("post: http.begin failed");
       continue;
     }
     http.addHeader("Content-Type", "application/json");
     int code = http.POST(body);
     http.end();
     if (code >= 200 && code < 300) {
-      Serial.printf("POST ok table=%d iot=%d api=%d\n", tableNumber, iotState, apiVal);
       return true;
     }
-    Serial.printf("POST try %d %s code=%d\n", attempt + 1, url.c_str(), code);
   }
   return false;
 }
@@ -390,18 +371,9 @@ void initWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
   // WiFi.begin("Wokwi-GUEST", "");
-  Serial.print("Connecting to WiFi ..");
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.println(WiFi.status());
-    Serial.print('.');
     delay(1000);
   }
-  Serial.println("Connected");
-  Serial.println(WiFi.status());
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("RRSI: ");
-  Serial.println(WiFi.RSSI());
 }
 
 //insert OLED screen library
@@ -420,7 +392,6 @@ void TCA9548A(uint8_t bus){
   Wire.beginTransmission(0x70);  // TCA9548A address, because pin A0 A1 A2 are 0 (go to ground)
   Wire.write(1 << bus);          // send byte to select bus
   Wire.endTransmission();
-  Serial.print(bus);
 }
 
 //variables for centering OLED display
@@ -526,41 +497,30 @@ static void refreshDisplay2() {
 }
 
 void setup() {
-  // put your setup code here, to run once:
   Serial.begin(115200);
-  Serial.println("Welcome to Library Reservation System ");
-  Serial.println("Keypad: 6-digit reservation OTP auto-sends; * clears.");
 
-  // Start I2C: SDA IO8, SCL IO9 (ST1 wiring)
+  // I2C: SDA IO8, SCL IO9
   Wire.begin(8, 9);
 
-    // Init OLED display on bus number 2
   TCA9548A(2);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;);
-  } 
-  // Clear the buffer
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
   display.clearDisplay();
 
-  // Init OLED display on bus number 3
   TCA9548A(3);
-  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
-    Serial.println(F("SSD1306 allocation failed"));
-    for(;;);
-  } 
-  // Clear the buffer
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    for (;;);
+  }
   display.clearDisplay();
 
-  //init Wifi
   initWiFi();
 
-  // init LED
-  pinMode(ST2buttonPin, INPUT_PULLUP); // set ESP32 pin to input pull-up mode
+  pinMode(ST2buttonPin, INPUT_PULLUP);
   pinMode(RT1buttonPin, INPUT_PULLUP);
   pinMode(GT1buttonPin, INPUT_PULLUP);
-  
-  pinMode(ST2ledPinR, OUTPUT);  // set ESP32 pin to output mode
+
+  pinMode(ST2ledPinR, OUTPUT);
   pinMode(ST2ledPinG, OUTPUT);
   pinMode(ST2ledPinB, OUTPUT);
   pinMode(RT1ledPinR, OUTPUT);
@@ -570,8 +530,7 @@ void setup() {
   pinMode(GT1ledPinG, OUTPUT);
   pinMode(GT1ledPinB, OUTPUT);
 
-  // All four slots match demo tables 1–4; sync persisted ``Table.status`` from API on boot
-  // (demo seeds 1=free, 2=occupied, 3=reserved, 4=free — see reload_frontend_demo status_cycle).
+  // Sync table status from API on boot
   ST1state = fetchStatusFromApi(TABLE_NUM_ST1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
   ST2state = fetchStatusFromApi(TABLE_NUM_ST2, 1, HTTP_GET_BOOT_TIMEOUT_MS);
   RT1state = fetchStatusFromApi(TABLE_NUM_RT1, 1, HTTP_GET_BOOT_TIMEOUT_MS);
@@ -581,81 +540,65 @@ void setup() {
   setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
   setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
 
-/*
-   //init display OLED
-  display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS);
-  display.clearDisplay();
-  display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE); // Draw white text
-*/
-
-
-  //INIT HX711
-  Serial.println("init HX711");
   TCA9548A(2);
   display.clearDisplay();
   display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE); // Draw white text
-  display.getTextBounds("WELCOME D1", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
+  display.setTextColor(SSD1306_WHITE);
+  display.getTextBounds("WELCOME D1", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
   width = (SCREEN_HEIGHT - h) / 2;
-  display.setCursor(length, width);     // kursor diletakkan pada rata tengah kolom 0
+  display.setCursor(length, width);
   display.print("WELCOME D1");
   display.display();
 
   TCA9548A(3);
   display.clearDisplay();
   display.setTextSize(2);
-  display.setTextColor(SSD1306_WHITE); // Draw white text
-  display.getTextBounds("WELCOME D2", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
+  display.setTextColor(SSD1306_WHITE);
+  display.getTextBounds("WELCOME D2", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
   width = (SCREEN_HEIGHT - h) / 2;
-  display.setCursor(length, width);     // kursor diletakkan pada rata tengah kolom 0
+  display.setCursor(length, width);
   display.print("WELCOME D2");
   display.display();
 
-
   scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
   scale.set_scale();
-  scale.tare(); //Reset the scale to 0
-  long zero_factor = scale.read_average(); //Get a baseline reading
+  scale.tare();
+  long zero_factor = scale.read_average();
+  (void)zero_factor;
   delay(1000);
 
-  //Write to OLED on bus number 2 ready to go
-  TCA9548A(2);  
+  TCA9548A(2);
   display.clearDisplay();
-  display.getTextBounds("Display 1 Ready!!!", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
+  display.getTextBounds("Display 1 Ready!!!", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
   width = (SCREEN_HEIGHT - h) / 2;
-  display.setCursor(length, width);     // kursor diletakkan pada rata tengah kolom 0
+  display.setCursor(length, width);
   display.print("Disp 1 Ready!!!");
   display.display();
-  Serial.println("Disp 1 Ready To Go");
   delay(1000);
 
-  //display 1
   display.clearDisplay();
-  display.getTextBounds("ST 1", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
-  display.setCursor(length, 0);     // kursor diletakkan pada rata tengah kolom 0
+  display.getTextBounds("ST 1", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(length, 0);
   display.print("ST 1");
 
-  display.getTextBounds("AVAILABLE", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
-  display.setCursor(length, 25);     // kursor diletakkan pada rata tengah kolom 0
+  display.getTextBounds("AVAILABLE", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
+  display.setCursor(length, 25);
   display.print("AVAILABLE");
   display.display();
 
-  //Write to OLED on bus number 3 ready to go
-  TCA9548A(3);  
+  TCA9548A(3);
   display.clearDisplay();
-  display.getTextBounds(" Display 2 Ready!!!", 0, 0, &x, &y, &w, &h); //untuk mendapatkan jumlah piksel dalam width dan tinggi untuk tulisan WELCOME
-  length = (SCREEN_WIDTH - w) / 2; // Untuk menentukan penempatan piksel pertama
+  display.getTextBounds(" Display 2 Ready!!!", 0, 0, &x, &y, &w, &h);
+  length = (SCREEN_WIDTH - w) / 2;
   width = (SCREEN_HEIGHT - h) / 2;
-  display.setCursor(length, width);     // kursor diletakkan pada rata tengah kolom 0
+  display.setCursor(length, width);
   display.print("Disp 2 Ready!!!");
   display.display();
-  Serial.println("Disp 2 Ready To Go");
   delay(1000);
 
   refreshDisplay2();
@@ -674,21 +617,18 @@ void loop() {
 
   // Buttons first — before slow scale/OLED/HTTP. Stable-low + release-rearm ⇒ one step per click.
   if (consumeStableTablePress(ST2buttonPin, st2Btn, now)) {
-    Serial.println("ST2 pressed — cycle status");
     ST2state = (ST2state + 1) % 3;
     setRgbForState(ST2ledPinR, ST2ledPinG, ST2ledPinB, ST2state);
     scheduleStatusPost(TABLE_NUM_ST2, ST2state);
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
   if (consumeStableTablePress(RT1buttonPin, rt1Btn, now)) {
-    Serial.println("RT1 pressed — cycle status");
     RT1state = (RT1state + 1) % 3;
     setRgbForState(RT1ledPinR, RT1ledPinG, RT1ledPinB, RT1state);
     scheduleStatusPost(TABLE_NUM_RT1, RT1state);
     suppressPollUntil = millis() + BTN_POLL_SUPPRESS_MS;
   }
   if (consumeStableTablePress(GT1buttonPin, gt1Btn, now)) {
-    Serial.println("GT1 pressed — cycle status");
     GT1state = (GT1state + 1) % 3;
     setRgbForState(GT1ledPinR, GT1ledPinG, GT1ledPinB, GT1state);
     scheduleStatusPost(TABLE_NUM_GT1, GT1state);
@@ -703,9 +643,9 @@ void loop() {
         (st1FeedbackKind != 0 && (unsigned long)kNow < st1FeedbackUntil) ||
         ((unsigned long)kNow < st1LockoutUntil);
     if (keypadBlocked) {
-      /* drop input during verify / feedback flash / lockout */
+      // Ignore input during OTP submit / feedback / lockout
     } else if (key == '#') {
-      /* ignored: OTP submits automatically after 6 digits */
+      // OTP auto-submits after 6 digits
     } else if (key == '*') {
       keypadInputBuffer = "";
     } else if (key >= '0' && key <= '9') {
@@ -759,10 +699,6 @@ void loop() {
     reading = 0.0f;
   }
   float weight = reading / 2100.00f * 5.00f;
-  Serial.print("reading = ");
-  Serial.print(reading, 3);
-  Serial.print(", weight = ");
-  Serial.println(weight, 3);
 
   // ST1: HX711 -> debounced IoT state 0/1 -> POST (2=reserved not used from weight)
   static int st1Cand = -1;

@@ -1,10 +1,37 @@
-# Testing strategies (Smart Library Table Reservation & IoT monitoring)
+# Capstone IoT
 
-Testing verified core behaviour: **reservations and business rules**, **authentication and roles**, **public map/APIs**, **admin console**, and **IoT/directory** admin APIs. Layout matches our reference format (expected vs actual vs status). **All cases below: Passed.**
+ESP32 firmware for the **Smart Library Table Reservation & IoT Monitoring** Capstone. Drives per-table RGB status LEDs, dual OLED displays, HX711 weight sensing, and keypad OTP check-in, syncing table status with the Django API.
+
+## Documentation
+
+Screenshots, hardware photos, and system walkthrough:
+
+**https://github.com/LinThitHtwe/Capstone_documentation**
+
+Related repos:
+
+- Backend: https://github.com/LinThitHtwe/Capstone_backend
+- Frontend: https://github.com/LinThitHtwe/Capstone_frontend
+
+## Firmware
+
+Sketch path: [`sketch_apr15a/sketch_apr15a.ino`](sketch_apr15a/sketch_apr15a.ino)
+
+Before flashing, set in the sketch:
+
+1. `ssid` / `password` — your Wi-Fi credentials  
+2. `API_HOST` — the PC’s LAN IPv4 running Django (`0.0.0.0:8001`)  
+3. `TABLE_NUM_*` — library table numbers that match the backend rows  
+
+Libraries typically required: WiFi, HTTPClient, Keypad, Adafruit GFX / SSD1306, HX711 (as used by the sketch).
 
 ---
 
-## 1. User reservations (highest priority)
+## Testing strategies (Smart Library Table Reservation & IoT monitoring)
+
+Testing verified core behaviour: **reservations and business rules**, **authentication and roles**, **public map/APIs**, **admin console**, and **IoT/directory** admin APIs. Layout matches our reference format (expected vs actual vs status). **All cases below: Passed.**
+
+### 1. User reservations (highest priority)
 
 | No | Test cases | Expected result | Actual result | Status |
 | --- | --- | --- | --- | --- |
@@ -14,9 +41,7 @@ Testing verified core behaviour: **reservations and business rules**, **authenti
 | 4 | Email send failure on create | Rollback; user error; no orphan reservation | Rolled back; error shown | Passed |
 | 5 | “My reservations” as non-admin; admin hits user booking API | Own list only; admin gets 403 | List scoped; 403 for admin | Passed |
 
----
-
-## 2. Sign up and authentication
+### 2. Sign up and authentication
 
 | No | Test cases | Expected result | Actual result | Status |
 | --- | --- | --- | --- | --- |
@@ -25,9 +50,7 @@ Testing verified core behaviour: **reservations and business rules**, **authenti
 | 3 | Non-admin opens `/admin/...` | Guard + admin APIs 403 | Redirect / 403 | Passed |
 | 4 | Sign-up: valid public role vs admin / invalid role | User created hashed; bad role rejected | Created / rejected as expected | Passed |
 
----
-
-## 3. Public library map and public APIs
+### 3. Public library map and public APIs
 
 | No | Test cases | Expected result | Actual result | Status |
 | --- | --- | --- | --- | --- |
@@ -35,9 +58,7 @@ Testing verified core behaviour: **reservations and business rules**, **authenti
 | 2 | `GET /api/map-reservations/` | Slots for map; no private user PII | Anonymized payload | Passed |
 | 3 | Weight-availability URL (valid / invalid table) | Sensor + end times when active; 404 if missing | Both cases correct | Passed |
 
----
-
-## 4. Admin console (dashboard, tables, reservations)
+### 4. Admin console (dashboard, tables, reservations)
 
 | No | Test cases | Expected result | Actual result | Status |
 | --- | --- | --- | --- | --- |
@@ -46,9 +67,7 @@ Testing verified core behaviour: **reservations and business rules**, **authenti
 | 3 | Reservation list/detail/filter; non-admin on admin APIs | List/detail OK; 403 for non-admin | Worked; 403 enforced | Passed |
 | 4 | Expired session / cleared token | APIs 401/403; UI to login | Handled | Passed |
 
----
-
-## 5. IoT admin and user directory
+### 5. IoT admin and user directory
 
 | No | Test cases | Expected result | Actual result | Status |
 | --- | --- | --- | --- | --- |
@@ -56,8 +75,6 @@ Testing verified core behaviour: **reservations and business rules**, **authenti
 | 2 | Non-admin on `/api/admin/...` IoT routes | 403 | 403 | Passed |
 | 3 | Directory by role: search, order whitelist, single admin rule | Filtered lists; safe ordering; second admin blocked | Lists and search OK; ordering safe; second admin rejected | Passed |
 
----
-
-## Summary
+### Summary
 
 **Reservations** (hours, slots, overlap, daily cap, email/OTP rollback) and **access control** (JWT, admin vs library user) were validated first, then **public map feeds**, **admin** tables and booking oversight, and finally **IoT** and **directory** admin endpoints. **Actual results matched expected results** for every row above (**Passed**).
